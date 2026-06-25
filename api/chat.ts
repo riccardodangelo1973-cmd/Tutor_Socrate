@@ -123,13 +123,58 @@ Se il file caricato non sembra leggibile, non contiene testo visibile rilevante 
       parts: newParts,
     });
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: contents,
-      config: {
-        systemInstruction,
-      },
-    });
+    // Helper to determine if an error is retryable (status 503, 429, or related messages)
+    const isRetryableError = (err: any): boolean => {
+      const status = err.status || err.statusCode || err.status_code;
+      if (status === 429 || status === 503) {
+        return true;
+      }
+      const msg = String(err.message || "").toLowerCase();
+      if (
+        msg.includes("503") || 
+        msg.includes("429") || 
+        msg.includes("unavailable") || 
+        msg.includes("resource_exhausted") || 
+        msg.includes("rate_limited") || 
+        msg.includes("quota")
+      ) {
+        return true;
+      }
+      return false;
+    };
+
+    const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    let response;
+    let attempts = 0;
+    const maxRetries = 3;
+
+    while (true) {
+      attempts++;
+      try {
+        console.log(`[Tutor Socrate API] Tentativo ${attempts}/4 di chiamata a Gemini...`);
+        response = await ai.models.generateContent({
+          model: "gemini-3.5-flash",
+          contents: contents,
+          config: {
+            systemInstruction,
+          },
+        });
+        console.log(`[Tutor Socrate API] Tentativo ${attempts} riuscito con successo!`);
+        break;
+      } catch (err: any) {
+        console.error(`[Tutor Socrate API] Tentativo ${attempts} fallito con errore:`, err.message || err);
+        const retryable = isRetryableError(err);
+        if (retryable && attempts <= maxRetries) {
+          const waitTime = Math.pow(2, attempts - 1) * 1000; // 1s, 2s, 4s
+          console.warn(`[Tutor Socrate API] Rilevato errore temporaneo (429/503). Avvio backoff esponenziale: attesa di ${waitTime / 1000} secondi prima del tentativo ${attempts + 1}...`);
+          await delay(waitTime);
+        } else {
+          // Non più tentativi o errore non retryable: rilanciamo l'errore
+          throw err;
+        }
+      }
+    }
 
     let reply = response.text || "";
 
@@ -147,17 +192,38 @@ Se il file caricato non sembra leggibile, non contiene testo visibile rilevante 
 
     return res.status(200).json({ reply });
   } catch (error: any) {
-    console.error("Errore chiamando l'API Gemini:", error);
+    console.error("Errore finale nella gestione del chatbot Socrate:", error);
 
-    // If rate limit error or quota exceeded
-    if (error.status === 429 || (error.message && error.message.includes("quota"))) {
-      return res.status(429).json({
-        error: "Sto avendo molte richieste in questo momento. Riprova tra qualche minuto.",
+    // Check if error is a retryable type (and we have exhausted our retries above)
+    const isRetryableError = (err: any): boolean => {
+      const status = err.status || err.statusCode || err.status_code;
+      if (status === 429 || status === 503) {
+        return true;
+      }
+      const msg = String(err.message || "").toLowerCase();
+      if (
+        msg.includes("503") || 
+        msg.includes("429") || 
+        msg.includes("unavailable") || 
+        msg.includes("resource_exhausted") || 
+        msg.includes("rate_limited") || 
+        msg.includes("quota")
+      ) {
+        return true;
+      }
+      return false;
+    };
+
+    if (isRetryableError(error)) {
+      return res.status(error.status || error.statusCode || 503).json({
+        error: "Il servizio è momentaneamente sovraccarico. Riprova tra qualche minuto.",
       });
     }
 
-    return res.status(500).json({
-      error: "Qualcosa è andato storto. Se il problema persiste, ricarica la pagina.",
+    // For other types of errors, return the error message if status is defined
+    const errorStatus = error.status || error.statusCode || 500;
+    return res.status(errorStatus).json({
+      error: error.message || "Qualcosa è andato storto. Se il problema persiste, ricarica la pagina.",
     });
   }
 }
