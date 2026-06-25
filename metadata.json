@@ -1,0 +1,6 @@
+{
+  "name": "Socrate",
+  "description": "Un tutor maieutico che aiuta gli studenti a ragionare ponendo le domande giuste.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
