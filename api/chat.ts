@@ -1,6 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 
-export default async function handler(req, res) {
+export default async function handler(req: any, res: any) {
   if (req.method !== "POST") {
     res.setHeader("Allow", ["POST"]);
     return res.status(455).json({ error: `Method ${req.method} Not Allowed` });
@@ -12,6 +12,29 @@ export default async function handler(req, res) {
       error: "Configurazione mancante: l'app non è configurata correttamente. Contatta il tuo docente."
     });
   }
+
+  // Helper to determine if an error is retryable (status 503, 429, or related messages)
+  const isRetryableError = (err: any): boolean => {
+    if (!err) return false;
+    const status = err.status || err.statusCode || err.status_code;
+    if (status === 429 || status === 503) {
+      return true;
+    }
+    const msg = String(err.message || "").toLowerCase();
+    if (
+      msg.includes("503") || 
+      msg.includes("429") || 
+      msg.includes("unavailable") || 
+      msg.includes("resource_exhausted") || 
+      msg.includes("rate_limited") || 
+      msg.includes("quota")
+    ) {
+      return true;
+    }
+    return false;
+  };
+
+  const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
   try {
     const { materia, anno, history = [], message = "", files = [] } = req.body;
@@ -123,57 +146,78 @@ Se il file caricato non sembra leggibile, non contiene testo visibile rilevante 
       parts: newParts,
     });
 
-    // Helper to determine if an error is retryable (status 503, 429, or related messages)
-    const isRetryableError = (err: any): boolean => {
-      const status = err.status || err.statusCode || err.status_code;
-      if (status === 429 || status === 503) {
-        return true;
-      }
-      const msg = String(err.message || "").toLowerCase();
-      if (
-        msg.includes("503") || 
-        msg.includes("429") || 
-        msg.includes("unavailable") || 
-        msg.includes("resource_exhausted") || 
-        msg.includes("rate_limited") || 
-        msg.includes("quota")
-      ) {
-        return true;
-      }
-      return false;
-    };
+    const models = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash", "flash-latest"];
+    let response: any = null;
+    let lastError: any = null;
+    let modelUsed = "";
 
-    const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    for (let m = 0; m < models.length; m++) {
+      const currentModel = models[m];
+      modelUsed = currentModel;
+      console.log(`[Tutor Socrate API] Prova modello: ${currentModel} (indice ${m + 1}/${models.length})`);
 
-    let response;
-    let attempts = 0;
-    const maxRetries = 3;
+      if (currentModel === "gemini-3.5-flash") {
+        // Retry logic on the principal model
+        let attempts = 0;
+        const maxRetries = 3; // 3 retries, so 4 total attempts
+        let success = false;
 
-    while (true) {
-      attempts++;
-      try {
-        console.log(`[Tutor Socrate API] Tentativo ${attempts}/4 di chiamata a Gemini...`);
-        response = await ai.models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: contents,
-          config: {
-            systemInstruction,
-          },
-        });
-        console.log(`[Tutor Socrate API] Tentativo ${attempts} riuscito con successo!`);
-        break;
-      } catch (err: any) {
-        console.error(`[Tutor Socrate API] Tentativo ${attempts} fallito con errore:`, err.message || err);
-        const retryable = isRetryableError(err);
-        if (retryable && attempts <= maxRetries) {
-          const waitTime = Math.pow(2, attempts - 1) * 1000; // 1s, 2s, 4s
-          console.warn(`[Tutor Socrate API] Rilevato errore temporaneo (429/503). Avvio backoff esponenziale: attesa di ${waitTime / 1000} secondi prima del tentativo ${attempts + 1}...`);
-          await delay(waitTime);
-        } else {
-          // Non più tentativi o errore non retryable: rilanciamo l'errore
-          throw err;
+        while (attempts <= maxRetries) {
+          attempts++;
+          try {
+            console.log(`[Tutor Socrate API] Modello principale ${currentModel} - Tentativo ${attempts}/${maxRetries + 1}...`);
+            response = await ai.models.generateContent({
+              model: currentModel,
+              contents: contents,
+              config: {
+                systemInstruction,
+              },
+            });
+            console.log(`[Tutor Socrate API] Modello principale ${currentModel} - Tentativo ${attempts} riuscito con successo!`);
+            success = true;
+            break;
+          } catch (err: any) {
+            lastError = err;
+            console.error(`[Tutor Socrate API] Modello principale ${currentModel} - Tentativo ${attempts} fallito con errore:`, err.message || err);
+            const retryable = isRetryableError(err);
+            if (retryable && attempts <= maxRetries) {
+              const waitTime = Math.pow(2, attempts - 1) * 1000; // 1s, 2s, 4s
+              console.warn(`[Tutor Socrate API] Rilevato errore temporaneo (429/503) sul modello principale. Avvio backoff esponenziale: attesa di ${waitTime / 1000} secondi prima del tentativo ${attempts + 1}...`);
+              await delay(waitTime);
+            } else {
+              console.warn(`[Tutor Socrate API] Errore non riproducibile o tentativi esauriti sul modello principale. Procedo al fallback...`);
+              break; // break the retry loop and fall back to the next model
+            }
+          }
+        }
+
+        if (success) {
+          break; // break the models loop
+        }
+      } else {
+        // For fallback models, we attempt once
+        try {
+          console.log(`[Tutor Socrate API] Fallback modello ${currentModel} - Avvio chiamata...`);
+          response = await ai.models.generateContent({
+            model: currentModel,
+            contents: contents,
+            config: {
+              systemInstruction,
+            },
+          });
+          console.log(`[Tutor Socrate API] Fallback modello ${currentModel} riuscito con successo!`);
+          break; // break the models loop
+        } catch (err: any) {
+          lastError = err;
+          console.error(`[Tutor Socrate API] Fallback modello ${currentModel} fallito con errore:`, err.message || err);
+          // Continua il ciclo per provare il prossimo modello di fallback
         }
       }
+    }
+
+    if (!response) {
+      // Se nessun modello ha funzionato, rilanciamo l'ultimo errore riscontrato
+      throw lastError || new Error("Nessun modello Gemini disponibile ha risposto correttamente.");
     }
 
     let reply = response.text || "";
@@ -194,26 +238,6 @@ Se il file caricato non sembra leggibile, non contiene testo visibile rilevante 
   } catch (error: any) {
     console.error("Errore finale nella gestione del chatbot Socrate:", error);
 
-    // Check if error is a retryable type (and we have exhausted our retries above)
-    const isRetryableError = (err: any): boolean => {
-      const status = err.status || err.statusCode || err.status_code;
-      if (status === 429 || status === 503) {
-        return true;
-      }
-      const msg = String(err.message || "").toLowerCase();
-      if (
-        msg.includes("503") || 
-        msg.includes("429") || 
-        msg.includes("unavailable") || 
-        msg.includes("resource_exhausted") || 
-        msg.includes("rate_limited") || 
-        msg.includes("quota")
-      ) {
-        return true;
-      }
-      return false;
-    };
-
     if (isRetryableError(error)) {
       return res.status(error.status || error.statusCode || 503).json({
         error: "Il servizio è momentaneamente sovraccarico. Riprova tra qualche minuto.",
@@ -227,3 +251,4 @@ Se il file caricato non sembra leggibile, non contiene testo visibile rilevante 
     });
   }
 }
+
